@@ -1,0 +1,16 @@
+[package]
+name = "tunnel-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tunnel-client"
+path = "src/main.rs"
+
+[dependencies]
+tunnel-protocol = { path = "../tunnel-protocol" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = "0.11"

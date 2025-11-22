@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  tunnel-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: speedforce-server
+    ports:
+      - "8080:8080"  # HTTP endpoint
+      - "7000:7000"  # Tunnel TCP port
+    environment:
+      HTTP_ADDR: "0.0.0.0:8080"
+      TUNNEL_ADDR: "0.0.0.0:7000"
+      RUST_LOG: "info"
+    networks:
+      - speedforce
+    restart: unless-stopped
+
+  tunnel-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: speedforce-client
+    environment:
+      SERVER_ADDR: "tunnel-server:7000"
+      LOCAL_PORT: "3000"
+      RUST_LOG: "info"
+    networks:
+      - speedforce
+    depends_on:
+      - tunnel-server
+    restart: unless-stopped
+
+networks:
+  speedforce:
+    driver: bridge
