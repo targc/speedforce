@@ -15,11 +15,13 @@ struct ServerConfig {
     addr: String,        // Host:port for TCP connection
     use_tls: bool,       // Whether to use TLS
     hostname: String,    // Hostname for SNI and Host header
+    auth: Option<String>, // Basic Auth credentials in "username:password" format
+    local_port: u16,     // Local service port
 }
 
 /// Parses server address from environment variable
 /// Supports: https://host, https://host:port, http://host:port, host:port
-fn parse_server_addr(addr: &str) -> Result<ServerConfig, String> {
+fn parse_server_addr(addr: &str, auth: Option<String>, local_port: u16) -> Result<ServerConfig, String> {
     if addr.starts_with("https://") {
         let without_protocol = addr.strip_prefix("https://").unwrap();
         let (host, port) = parse_host_port(without_protocol, 443)?;
@@ -27,6 +29,8 @@ fn parse_server_addr(addr: &str) -> Result<ServerConfig, String> {
             addr: format!("{}:{}", host, port),
             use_tls: true,
             hostname: host,
+            auth,
+            local_port,
         })
     } else if addr.starts_with("http://") {
         let without_protocol = addr.strip_prefix("http://").unwrap();
@@ -35,6 +39,8 @@ fn parse_server_addr(addr: &str) -> Result<ServerConfig, String> {
             addr: format!("{}:{}", host, port),
             use_tls: false,
             hostname: host,
+            auth,
+            local_port,
         })
     } else {
         // Backward compatibility: no protocol means plain TCP
@@ -43,6 +49,8 @@ fn parse_server_addr(addr: &str) -> Result<ServerConfig, String> {
             addr: format!("{}:{}", host, port),
             use_tls: false,
             hostname: host,
+            auth,
+            local_port,
         })
     }
 }
@@ -92,10 +100,31 @@ async fn main() {
 
     // Parse configuration from environment variables
     let server_addr_str = env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
-    let local_port = env::var("LOCAL_PORT").unwrap_or_else(|_| "3000".to_string());
+    let local_port_str = env::var("LOCAL_PORT").unwrap_or_else(|_| "3000".to_string());
+    let tunnel_auth = env::var("TUNNEL_AUTH").ok();
+
+    // Parse local port
+    let local_port = match local_port_str.parse::<u16>() {
+        Ok(port) => port,
+        Err(e) => {
+            error!("Invalid LOCAL_PORT: {}", e);
+            return;
+        }
+    };
+
+    // Validate auth format if provided
+    if let Some(ref auth) = tunnel_auth {
+        if !auth.contains(':') {
+            error!("TUNNEL_AUTH must be in format 'username:password'");
+            return;
+        }
+        info!("Basic authentication enabled");
+    } else {
+        info!("No authentication configured");
+    }
 
     // Parse server address
-    let server_config = match parse_server_addr(&server_addr_str) {
+    let server_config = match parse_server_addr(&server_addr_str, tunnel_auth, local_port) {
         Ok(config) => config,
         Err(e) => {
             error!("Failed to parse SERVER_ADDR: {}", e);
@@ -105,7 +134,7 @@ async fn main() {
 
     info!(
         "Starting client - will connect to {} (TLS: {}) and forward to http://127.0.0.1:{}",
-        server_config.addr, server_config.use_tls, local_port
+        server_config.addr, server_config.use_tls, server_config.local_port
     );
 
     // Connection loop with exponential backoff
@@ -121,7 +150,7 @@ async fn main() {
                 backoff_duration = Duration::from_secs(1);
 
                 // Handle tunnel connection
-                handle_tunnel_connection(stream, &local_port).await;
+                handle_tunnel_connection(stream, server_config.local_port).await;
 
                 info!("Disconnected from server");
             }
@@ -209,16 +238,32 @@ impl tokio::io::AsyncWrite for TunnelStream {
 async fn send_upgrade_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     hostname: &str,
+    auth: Option<&str>,
 ) -> Result<(), String> {
+    // Build Authorization header if credentials provided
+    let auth_header = if let Some(credentials) = auth {
+        let encoded = encode_body(credentials.as_bytes());
+        Some(format!("Authorization: Basic {}\r\n", encoded))
+    } else {
+        None
+    };
+
     // Send HTTP Upgrade request
-    let upgrade_request = format!(
+    let mut upgrade_request = format!(
         "GET /tunnel HTTP/1.1\r\n\
          Host: {}\r\n\
          Upgrade: tunnel\r\n\
-         Connection: Upgrade\r\n\
-         \r\n",
+         Connection: Upgrade\r\n",
         hostname
     );
+
+    // Add Authorization header if present
+    if let Some(auth) = auth_header {
+        upgrade_request.push_str(&auth);
+    }
+
+    // End of headers
+    upgrade_request.push_str("\r\n");
 
     stream.write_all(upgrade_request.as_bytes()).await
         .map_err(|e| format!("Failed to send upgrade request: {}", e))?;
@@ -261,6 +306,11 @@ async fn send_upgrade_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let first_line = response_str.lines().next()
         .ok_or("Empty response")?;
 
+    // Check for authentication failure
+    if first_line.contains("401") {
+        return Err("Authentication failed: Invalid credentials".to_string());
+    }
+
     // Check for 101 Switching Protocols
     if !first_line.contains("101") {
         return Err(format!("Upgrade failed: {}", first_line));
@@ -302,7 +352,11 @@ async fn connect_and_upgrade(config: &ServerConfig) -> Result<TunnelStream, Stri
         info!("TLS connection established");
 
         // Send HTTP Upgrade over TLS
-        send_upgrade_request(&mut tls_stream, &config.hostname).await?;
+        send_upgrade_request(
+            &mut tls_stream,
+            &config.hostname,
+            config.auth.as_deref()
+        ).await?;
 
         Ok(TunnelStream::Tls(tls_stream))
     } else {
@@ -310,14 +364,18 @@ async fn connect_and_upgrade(config: &ServerConfig) -> Result<TunnelStream, Stri
         let mut tcp_stream = tcp_stream;
 
         // Send HTTP Upgrade over plain TCP
-        send_upgrade_request(&mut tcp_stream, &config.hostname).await?;
+        send_upgrade_request(
+            &mut tcp_stream,
+            &config.hostname,
+            config.auth.as_deref()
+        ).await?;
 
         Ok(TunnelStream::Plain(tcp_stream))
     }
 }
 
 /// Handles the tunnel connection by processing requests until disconnect
-async fn handle_tunnel_connection(stream: TunnelStream, local_port: &str) {
+async fn handle_tunnel_connection(stream: TunnelStream, local_port: u16) {
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut writer = write_half;
@@ -362,7 +420,7 @@ async fn handle_tunnel_connection(stream: TunnelStream, local_port: &str) {
 }
 
 /// Processes a tunnel request by forwarding to local HTTP service
-async fn process_request(tunnel_req: TunnelRequest, local_port: &str) -> TunnelResponse {
+async fn process_request(tunnel_req: TunnelRequest, local_port: u16) -> TunnelResponse {
     // Decode request body
     let request_body = match decode_body(&tunnel_req.body) {
         Ok(b) => b,

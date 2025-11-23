@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Response, StatusCode, header},
+    http::{Request, Response, StatusCode, header, HeaderMap},
     routing::{any, get},
     Router,
 };
@@ -31,12 +31,14 @@ struct TunnelConnection {
 #[derive(Clone)]
 struct ServerState {
     active_client: Arc<RwLock<Option<Arc<TunnelConnection>>>>,
+    tunnel_auth: Option<String>, // username:password for Basic Auth
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(tunnel_auth: Option<String>) -> Self {
         Self {
             active_client: Arc::new(RwLock::new(None)),
+            tunnel_auth,
         }
     }
 }
@@ -48,9 +50,17 @@ async fn main() {
 
     // Parse configuration from environment variables
     let http_addr = env::var("HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let tunnel_auth = env::var("TUNNEL_AUTH").ok();
+
+    // Log authentication status
+    if tunnel_auth.is_some() {
+        info!("Tunnel authentication enabled");
+    } else {
+        info!("Tunnel authentication disabled");
+    }
 
     // Initialize shared state
-    let state = ServerState::new();
+    let state = ServerState::new(tunnel_auth);
 
     // Build HTTP router
     let app = Router::new()
@@ -64,11 +74,55 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Extracts Basic Auth credentials from Authorization header
+/// Returns Some(username:password) if valid Basic Auth header is present
+fn extract_basic_auth(headers: &HeaderMap) -> Option<String> {
+    let auth_header = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+
+    if !auth_header.starts_with("Basic ") {
+        return None;
+    }
+
+    let encoded = auth_header.strip_prefix("Basic ")?;
+    let decoded = tunnel_protocol::decode_body(encoded).ok()?;
+    let credentials = String::from_utf8(decoded).ok()?;
+
+    Some(credentials)
+}
+
 /// Handles HTTP Upgrade requests to establish tunnel connections
 async fn tunnel_upgrade_handler(
     State(state): State<ServerState>,
     request: Request<Body>,
 ) -> Response<Body> {
+    // Check authentication if enabled
+    if let Some(ref expected_auth) = state.tunnel_auth {
+        match extract_basic_auth(request.headers()) {
+            Some(provided_auth) if provided_auth == *expected_auth => {
+                // Authentication successful
+                info!("Client authenticated successfully");
+            }
+            Some(_) => {
+                // Invalid credentials
+                error!("Authentication failed: Invalid credentials");
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(header::WWW_AUTHENTICATE, "Basic realm=\"tunnel\"")
+                    .body(Body::from("Invalid credentials"))
+                    .unwrap();
+            }
+            None => {
+                // Missing Authorization header
+                error!("Authentication failed: Missing Authorization header");
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(header::WWW_AUTHENTICATE, "Basic realm=\"tunnel\"")
+                    .body(Body::from("Authorization required"))
+                    .unwrap();
+            }
+        }
+    }
+
     // Check for upgrade headers
     let upgrade_header = request.headers().get(header::UPGRADE);
     let connection_header = request.headers().get(header::CONNECTION);

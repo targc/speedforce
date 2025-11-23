@@ -11,6 +11,7 @@ A minimal HTTP tunnel for local development and webhook debugging. Forward HTTP 
 - 🔌 **Single Port** - HTTP and tunnel traffic multiplexed on one port via HTTP Upgrade
 - 🔗 **Standard Protocol** - Uses HTTP 101 Switching Protocols (like WebSocket)
 - 🔒 **TLS/HTTPS Support** - Secure encrypted connections with certificate validation
+- 🔐 **Basic Authentication** - Optional username/password protection for tunnel connections
 - 🐳 **Docker Ready** - Dockerfiles and docker-compose included
 
 ## Quick Start
@@ -88,6 +89,7 @@ docker-compose up -d
 
 **tunnel-server:**
 - `HTTP_ADDR` - Server bind address for both HTTP and tunnel connections (default: `0.0.0.0:8080`)
+- `TUNNEL_AUTH` - Optional Basic Auth credentials in format `username:password` (default: none, auth disabled)
 - `RUST_LOG` - Logging level (default: `info`, options: `debug`, `info`, `warn`, `error`)
 
 **tunnel-client:**
@@ -97,6 +99,7 @@ docker-compose up -d
   - Supports: `http://example.com:8080` (no TLS)
   - Supports: `example.com:8080` (no TLS, backward compat)
 - `LOCAL_PORT` - Local HTTP service port (default: `3000`)
+- `TUNNEL_AUTH` - Optional Basic Auth credentials in format `username:password` (default: none)
 - `RUST_LOG` - Logging level (default: `info`)
 
 ## Architecture
@@ -217,6 +220,80 @@ If you encounter certificate validation errors:
 
 For self-signed certificates or testing, consider using a reverse proxy (nginx/Caddy) with a valid Let's Encrypt certificate.
 
+## Basic Authentication
+
+The tunnel server supports Basic Authentication to restrict which clients can connect.
+
+### Enabling Authentication
+
+**Server side:**
+```bash
+# Set credentials in format username:password
+TUNNEL_AUTH=myuser:mypassword ./target/release/tunnel-server
+```
+
+**Client side:**
+```bash
+# Provide matching credentials
+TUNNEL_AUTH=myuser:mypassword \
+SERVER_ADDR=https://your-server.com \
+./target/release/tunnel-client
+```
+
+### Docker with Authentication
+
+**Server:**
+```bash
+docker run -d \
+  -p 8080:8080 \
+  -e TUNNEL_AUTH=myuser:mypassword \
+  -e RUST_LOG=info \
+  speedforce-server
+```
+
+**Client:**
+```bash
+docker run -d \
+  -e SERVER_ADDR=https://your-server.com \
+  -e TUNNEL_AUTH=myuser:mypassword \
+  -e LOCAL_PORT=3000 \
+  --network host \
+  speedforce-client
+```
+
+### Security Notes
+
+⚠️ **Important:** Basic Auth sends credentials in base64 encoding (NOT encryption)
+
+**Best Practices:**
+- ✅ **Always use HTTPS:** Basic Auth over HTTP exposes credentials in plaintext
+- ✅ **Strong Passwords:** Use long, random passwords (e.g., generated with `openssl rand -base64 32`)
+- ✅ **Environment Variables:** Never hardcode credentials in code or commit them to git
+- ✅ **Rotate Regularly:** Change credentials periodically
+- ⚠️ **Not a Substitute:** Use in addition to network security (VPN, firewall), not instead of it
+
+### Backward Compatibility
+
+Authentication is **optional** and **disabled by default**:
+
+- If `TUNNEL_AUTH` is not set on server → No authentication required (all clients accepted)
+- If `TUNNEL_AUTH` not set on client → No credentials sent
+- Existing deployments continue to work without any changes
+
+### Authentication Errors
+
+**401 Unauthorized responses:**
+
+```bash
+# Missing credentials
+ERROR: Authentication failed: Missing Authorization header
+
+# Invalid credentials
+ERROR: Authentication failed: Invalid credentials
+```
+
+The client will automatically retry with exponential backoff.
+
 ## Use Cases
 
 ✅ **Perfect for:**
@@ -305,10 +382,11 @@ curl http://127.0.0.1:3000/
 ✅ **TLS/HTTPS Support:** Client supports encrypted connections with certificate validation
 ✅ **Certificate Validation:** Uses Mozilla's trusted root CA certificates
 ✅ **End-to-End Encryption:** When using HTTPS, all tunnel traffic is encrypted
+✅ **Basic Authentication:** Optional username/password protection for tunnel connections
 
 ### Security Limitations
 
-⚠️ **No Authentication:** Anyone who can connect to the server port can use the tunnel
+⚠️ **Basic Auth is not encrypted:** Credentials sent in base64 (use with HTTPS!)
 ⚠️ **No Authorization:** All HTTP requests are forwarded to the local service
 ⚠️ **Server-side TLS:** The server itself doesn't handle TLS (use reverse proxy)
 
