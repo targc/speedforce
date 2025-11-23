@@ -57,12 +57,30 @@ docker run -d \
   speedforce-server
 ```
 
+**Client-only deployment:**
+```bash
+# Build client image
+docker build -f Dockerfile.client -t speedforce-client .
+
+# Run client connecting to your server
+docker run -d \
+  -e SERVER_ADDR=https://your-server.com \
+  -e LOCAL_PORT=3000 \
+  -e RUST_LOG=info \
+  --network host \
+  --name speedforce-client \
+  speedforce-client
+```
+
 **Full stack with docker-compose:**
 ```bash
 docker-compose up -d
 ```
 
-**Note:** Typically you run the server in Docker on a public VPS, and the client runs natively on your dev machine to forward to localhost services.
+**Note:**
+- **Server:** Typically runs in Docker on a public VPS
+- **Client:** Can run natively on your dev machine OR in Docker with `--network host`
+- **Network Mode:** Use `--network host` so the client can access localhost services
 
 ## Configuration
 
