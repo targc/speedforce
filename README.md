@@ -10,6 +10,7 @@ A minimal HTTP tunnel for local development and webhook debugging. Forward HTTP 
 - 📦 **Binary Support** - Handles arbitrary binary HTTP bodies via base64 encoding
 - 🔌 **Single Port** - HTTP and tunnel traffic multiplexed on one port via HTTP Upgrade
 - 🔗 **Standard Protocol** - Uses HTTP 101 Switching Protocols (like WebSocket)
+- 🔒 **TLS/HTTPS Support** - Secure encrypted connections with certificate validation
 - 🐳 **Docker Ready** - Dockerfiles and docker-compose included
 
 ## Quick Start
@@ -28,7 +29,11 @@ HTTP_ADDR=0.0.0.0:8080 ./target/release/tunnel-server
 
 **3. Start the client (on your dev machine):**
 ```bash
-SERVER_ADDR=<SERVER_IP>:8080 LOCAL_PORT=3000 ./target/release/tunnel-client
+# HTTP connection (no TLS)
+SERVER_ADDR=http://<SERVER_IP>:8080 LOCAL_PORT=3000 ./target/release/tunnel-client
+
+# HTTPS connection (with TLS)
+SERVER_ADDR=https://<SERVER_DOMAIN> LOCAL_PORT=3000 ./target/release/tunnel-client
 ```
 
 **4. Send HTTP requests:**
@@ -68,7 +73,11 @@ docker-compose up -d
 - `RUST_LOG` - Logging level (default: `info`, options: `debug`, `info`, `warn`, `error`)
 
 **tunnel-client:**
-- `SERVER_ADDR` - Server HTTP address to connect (default: `127.0.0.1:8080`)
+- `SERVER_ADDR` - Server address with protocol (default: `http://127.0.0.1:8080`)
+  - Supports: `https://example.com` (TLS on port 443)
+  - Supports: `https://example.com:8443` (TLS on custom port)
+  - Supports: `http://example.com:8080` (no TLS)
+  - Supports: `example.com:8080` (no TLS, backward compat)
 - `LOCAL_PORT` - Local HTTP service port (default: `3000`)
 - `RUST_LOG` - Logging level (default: `info`)
 
@@ -151,6 +160,44 @@ All messages over the upgraded connection use length-prefixed framing:
   "body": "eyJzdWNjZXNzIjp0cnVlfQ=="  // base64-encoded
 }
 ```
+
+## TLS/HTTPS Support
+
+The tunnel-client supports secure HTTPS connections with full TLS encryption and certificate validation.
+
+### Using HTTPS
+
+```bash
+# Connect to HTTPS server (uses port 443 by default)
+SERVER_ADDR=https://tunnel.example.com ./target/release/tunnel-client
+
+# Connect to HTTPS server on custom port
+SERVER_ADDR=https://tunnel.example.com:8443 ./target/release/tunnel-client
+
+# Real example
+SERVER_ADDR=https://s-server-601322859433294403.olufy-0.nortezh.com ./target/release/tunnel-client
+```
+
+### Security Features
+
+- ✅ **Certificate Validation:** Uses Mozilla's trusted root certificates
+- ✅ **SNI Support:** Proper Server Name Indication for virtual hosting
+- ✅ **End-to-End Encryption:** All tunnel traffic encrypted over TLS
+- ✅ **Modern TLS:** Uses rustls for secure, pure-Rust TLS implementation
+
+### Certificate Errors
+
+If you encounter certificate validation errors:
+
+```bash
+# Error: invalid certificate
+# Solution: Ensure your server has a valid TLS certificate from a trusted CA
+
+# Error: invalid DNS name
+# Solution: SERVER_ADDR must match the certificate's Common Name or SAN
+```
+
+For self-signed certificates or testing, consider using a reverse proxy (nginx/Caddy) with a valid Let's Encrypt certificate.
 
 ## Use Cases
 
@@ -235,18 +282,25 @@ curl http://127.0.0.1:3000/
 
 ## Security Considerations
 
-⚠️ **This is a development tool with NO built-in security:**
+### Built-in Security Features
 
-- **No TLS/encryption** - All traffic is plaintext
-- **No authentication** - Anyone can connect as a client
-- **No authorization** - All HTTP requests are forwarded
+✅ **TLS/HTTPS Support:** Client supports encrypted connections with certificate validation
+✅ **Certificate Validation:** Uses Mozilla's trusted root CA certificates
+✅ **End-to-End Encryption:** When using HTTPS, all tunnel traffic is encrypted
+
+### Security Limitations
+
+⚠️ **No Authentication:** Anyone who can connect to the server port can use the tunnel
+⚠️ **No Authorization:** All HTTP requests are forwarded to the local service
+⚠️ **Server-side TLS:** The server itself doesn't handle TLS (use reverse proxy)
 
 **Recommendations:**
-- Use SSH tunnel or VPN for secure communication
-- Firewall the HTTP port (8080) to trusted IPs only
-- Never expose to public internet without additional security layers
-- Consider this for development/debugging only
-- Add TLS termination with reverse proxy (nginx/Caddy) for production
+- **Use HTTPS:** Always connect via `https://` in production
+- **Reverse Proxy:** Deploy server behind nginx/Caddy for TLS termination
+- **Firewall Rules:** Restrict server port access to trusted IPs
+- **VPN/SSH Tunnel:** Additional layer for sensitive environments
+- **Authentication:** Add authentication in your local service, not the tunnel
+- **Development Only:** This tool is designed for dev/debugging, not production traffic
 
 ## Performance
 

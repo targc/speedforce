@@ -1,10 +1,89 @@
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
+use tokio_rustls::TlsConnector;
+use rustls::{ClientConfig, RootCertStore};
+use rustls::pki_types::ServerName;
 use tracing::{error, info};
 use tunnel_protocol::{decode_body, encode_body, read_frame, write_frame, TunnelRequest, TunnelResponse};
+
+/// Configuration for server connection
+struct ServerConfig {
+    addr: String,        // Host:port for TCP connection
+    use_tls: bool,       // Whether to use TLS
+    hostname: String,    // Hostname for SNI and Host header
+}
+
+/// Parses server address from environment variable
+/// Supports: https://host, https://host:port, http://host:port, host:port
+fn parse_server_addr(addr: &str) -> Result<ServerConfig, String> {
+    if addr.starts_with("https://") {
+        let without_protocol = addr.strip_prefix("https://").unwrap();
+        let (host, port) = parse_host_port(without_protocol, 443)?;
+        Ok(ServerConfig {
+            addr: format!("{}:{}", host, port),
+            use_tls: true,
+            hostname: host,
+        })
+    } else if addr.starts_with("http://") {
+        let without_protocol = addr.strip_prefix("http://").unwrap();
+        let (host, port) = parse_host_port(without_protocol, 80)?;
+        Ok(ServerConfig {
+            addr: format!("{}:{}", host, port),
+            use_tls: false,
+            hostname: host,
+        })
+    } else {
+        // Backward compatibility: no protocol means plain TCP
+        let (host, port) = parse_host_port(addr, 7000)?;
+        Ok(ServerConfig {
+            addr: format!("{}:{}", host, port),
+            use_tls: false,
+            hostname: host,
+        })
+    }
+}
+
+/// Parses host and port from address string
+fn parse_host_port(addr: &str, default_port: u16) -> Result<(String, u16), String> {
+    // Remove trailing slash if present
+    let addr = addr.trim_end_matches('/');
+
+    if let Some(colon_pos) = addr.rfind(':') {
+        // Check if this is an IPv6 address
+        if addr.starts_with('[') {
+            // IPv6 format: [host]:port or [host]
+            if let Some(bracket_pos) = addr.find(']') {
+                let host = addr[1..bracket_pos].to_string();
+                if colon_pos > bracket_pos {
+                    // Has port
+                    let port_str = &addr[colon_pos + 1..];
+                    let port = port_str.parse::<u16>()
+                        .map_err(|_| format!("Invalid port: {}", port_str))?;
+                    Ok((host, port))
+                } else {
+                    // No port
+                    Ok((host, default_port))
+                }
+            } else {
+                Err("Invalid IPv6 address format".to_string())
+            }
+        } else {
+            // IPv4 or hostname: host:port
+            let host = addr[..colon_pos].to_string();
+            let port_str = &addr[colon_pos + 1..];
+            let port = port_str.parse::<u16>()
+                .map_err(|_| format!("Invalid port: {}", port_str))?;
+            Ok((host, port))
+        }
+    } else {
+        // No port specified, use default
+        Ok((addr.to_string(), default_port))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -12,17 +91,29 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // Parse configuration from environment variables
-    let server_addr = env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
+    let server_addr_str = env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
     let local_port = env::var("LOCAL_PORT").unwrap_or_else(|_| "3000".to_string());
 
-    info!("Starting client - will forward to http://127.0.0.1:{}", local_port);
+    // Parse server address
+    let server_config = match parse_server_addr(&server_addr_str) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Failed to parse SERVER_ADDR: {}", e);
+            return;
+        }
+    };
+
+    info!(
+        "Starting client - will connect to {} (TLS: {}) and forward to http://127.0.0.1:{}",
+        server_config.addr, server_config.use_tls, local_port
+    );
 
     // Connection loop with exponential backoff
     let mut backoff_duration = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        match connect_and_upgrade(&server_addr).await {
+        match connect_and_upgrade(&server_config).await {
             Ok(stream) => {
                 info!("Connected and upgraded to tunnel protocol");
 
@@ -46,15 +137,79 @@ async fn main() {
     }
 }
 
-/// Connects to the server and performs HTTP Upgrade handshake
-async fn connect_and_upgrade(server_addr: &str) -> Result<TcpStream, String> {
-    // Connect to the server
-    let mut stream = TcpStream::connect(server_addr).await
-        .map_err(|e| format!("TCP connection failed: {}", e))?;
+/// Creates a TLS connector with system root certificates
+fn create_tls_connector() -> Result<TlsConnector, String> {
+    let mut root_store = RootCertStore::empty();
 
-    // Extract host from server address for Host header
-    let host = server_addr.split(':').next().unwrap_or(server_addr);
+    // Add system root certificates
+    for cert in webpki_roots::TLS_SERVER_ROOTS.iter() {
+        root_store.roots.push(cert.clone());
+    }
 
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Stream type that can be either TLS or plain TCP
+enum TunnelStream {
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    Plain(TcpStream),
+}
+
+impl tokio::io::AsyncRead for TunnelStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for TunnelStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TunnelStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            TunnelStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Sends HTTP Upgrade request over any stream type
+async fn send_upgrade_request<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    hostname: &str,
+) -> Result<(), String> {
     // Send HTTP Upgrade request
     let upgrade_request = format!(
         "GET /tunnel HTTP/1.1\r\n\
@@ -62,11 +217,13 @@ async fn connect_and_upgrade(server_addr: &str) -> Result<TcpStream, String> {
          Upgrade: tunnel\r\n\
          Connection: Upgrade\r\n\
          \r\n",
-        host
+        hostname
     );
 
     stream.write_all(upgrade_request.as_bytes()).await
         .map_err(|e| format!("Failed to send upgrade request: {}", e))?;
+    stream.flush().await
+        .map_err(|e| format!("Failed to flush upgrade request: {}", e))?;
 
     // Read HTTP response
     let mut response_buffer = vec![0u8; 1024];
@@ -89,7 +246,7 @@ async fn connect_and_upgrade(server_addr: &str) -> Result<TcpStream, String> {
                 .windows(4)
                 .position(|window| window == b"\r\n\r\n");
 
-            if let Some(_) = headers_end {
+            if headers_end.is_some() {
                 break;
             }
         }
@@ -118,11 +275,49 @@ async fn connect_and_upgrade(server_addr: &str) -> Result<TcpStream, String> {
     }
 
     info!("HTTP Upgrade successful");
-    Ok(stream)
+    Ok(())
+}
+
+/// Connects to the server and performs HTTP Upgrade handshake
+async fn connect_and_upgrade(config: &ServerConfig) -> Result<TunnelStream, String> {
+    // Connect TCP
+    let tcp_stream = TcpStream::connect(&config.addr).await
+        .map_err(|e| format!("TCP connection to {} failed: {}", config.addr, e))?;
+
+    info!("TCP connection established to {}", config.addr);
+
+    if config.use_tls {
+        // Establish TLS connection
+        info!("Establishing TLS connection to {}", config.hostname);
+
+        let tls_connector = create_tls_connector()
+            .map_err(|e| format!("Failed to create TLS connector: {}", e))?;
+
+        let server_name = ServerName::try_from(config.hostname.clone())
+            .map_err(|e| format!("Invalid hostname for SNI: {}", e))?;
+
+        let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await
+            .map_err(|e| format!("TLS handshake failed: {}", e))?;
+
+        info!("TLS connection established");
+
+        // Send HTTP Upgrade over TLS
+        send_upgrade_request(&mut tls_stream, &config.hostname).await?;
+
+        Ok(TunnelStream::Tls(tls_stream))
+    } else {
+        // Plain TCP connection
+        let mut tcp_stream = tcp_stream;
+
+        // Send HTTP Upgrade over plain TCP
+        send_upgrade_request(&mut tcp_stream, &config.hostname).await?;
+
+        Ok(TunnelStream::Plain(tcp_stream))
+    }
 }
 
 /// Handles the tunnel connection by processing requests until disconnect
-async fn handle_tunnel_connection(stream: TcpStream, local_port: &str) {
+async fn handle_tunnel_connection(stream: TunnelStream, local_port: &str) {
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut writer = write_half;
