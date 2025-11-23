@@ -1,6 +1,6 @@
 use std::env;
 use std::time::Duration;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
 use tracing::{error, info};
@@ -22,9 +22,9 @@ async fn main() {
     let max_backoff = Duration::from_secs(30);
 
     loop {
-        match TcpStream::connect(&server_addr).await {
+        match connect_and_upgrade(&server_addr).await {
             Ok(stream) => {
-                info!("Connected to server at {}", server_addr);
+                info!("Connected and upgraded to tunnel protocol");
 
                 // Reset backoff on successful connection
                 backoff_duration = Duration::from_secs(1);
@@ -35,7 +35,7 @@ async fn main() {
                 info!("Disconnected from server");
             }
             Err(e) => {
-                error!("Connection failed: {}", e);
+                error!("Connection/upgrade failed: {}", e);
             }
         }
 
@@ -44,6 +44,81 @@ async fn main() {
         sleep(backoff_duration).await;
         backoff_duration = std::cmp::min(backoff_duration * 2, max_backoff);
     }
+}
+
+/// Connects to the server and performs HTTP Upgrade handshake
+async fn connect_and_upgrade(server_addr: &str) -> Result<TcpStream, String> {
+    // Connect to the server
+    let mut stream = TcpStream::connect(server_addr).await
+        .map_err(|e| format!("TCP connection failed: {}", e))?;
+
+    // Extract host from server address for Host header
+    let host = server_addr.split(':').next().unwrap_or(server_addr);
+
+    // Send HTTP Upgrade request
+    let upgrade_request = format!(
+        "GET /tunnel HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Upgrade: tunnel\r\n\
+         Connection: Upgrade\r\n\
+         \r\n",
+        host
+    );
+
+    stream.write_all(upgrade_request.as_bytes()).await
+        .map_err(|e| format!("Failed to send upgrade request: {}", e))?;
+
+    // Read HTTP response
+    let mut response_buffer = vec![0u8; 1024];
+    let mut total_read = 0;
+
+    // Read until we have the complete response headers (ending with \r\n\r\n)
+    loop {
+        let n = stream.read(&mut response_buffer[total_read..]).await
+            .map_err(|e| format!("Failed to read upgrade response: {}", e))?;
+
+        if n == 0 {
+            return Err("Connection closed before receiving upgrade response".to_string());
+        }
+
+        total_read += n;
+
+        // Check if we have the end of headers
+        if total_read >= 4 {
+            let headers_end = response_buffer[..total_read]
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n");
+
+            if let Some(_) = headers_end {
+                break;
+            }
+        }
+
+        if total_read >= response_buffer.len() {
+            return Err("Response headers too large".to_string());
+        }
+    }
+
+    // Parse the HTTP response status line
+    let response_str = String::from_utf8_lossy(&response_buffer[..total_read]);
+    let first_line = response_str.lines().next()
+        .ok_or("Empty response")?;
+
+    // Check for 101 Switching Protocols
+    if !first_line.contains("101") {
+        return Err(format!("Upgrade failed: {}", first_line));
+    }
+
+    // Verify Upgrade and Connection headers
+    let has_upgrade = response_str.to_lowercase().contains("upgrade: tunnel");
+    let has_connection = response_str.to_lowercase().contains("connection: upgrade");
+
+    if !has_upgrade || !has_connection {
+        return Err("Missing required upgrade headers in response".to_string());
+    }
+
+    info!("HTTP Upgrade successful");
+    Ok(stream)
 }
 
 /// Handles the tunnel connection by processing requests until disconnect

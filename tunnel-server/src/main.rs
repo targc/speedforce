@@ -1,33 +1,30 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, Response, StatusCode},
-    routing::any,
+    http::{Request, Response, StatusCode, header},
+    routing::{any, get},
     Router,
 };
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use std::env;
 use std::sync::Arc;
-use tokio::io::{BufReader, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::io::BufReader;
+use tokio::sync::{mpsc, RwLock, oneshot};
 use tokio::time::{timeout, Duration};
 use tracing::{error, info};
 use tunnel_protocol::{decode_body, encode_body, read_frame, write_frame, TunnelRequest, TunnelResponse};
 
-/// Shared connection to the active tunnel client
-struct TunnelConnection {
-    reader: Arc<RwLock<BufReader<ReadHalf<TcpStream>>>>,
-    writer: Arc<RwLock<WriteHalf<TcpStream>>>,
+/// Request sent to the tunnel worker
+struct TunnelWorkerRequest {
+    payload: Vec<u8>,
+    response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
-impl TunnelConnection {
-    fn new(stream: TcpStream) -> Self {
-        let (read_half, write_half) = tokio::io::split(stream);
-        Self {
-            reader: Arc::new(RwLock::new(BufReader::new(read_half))),
-            writer: Arc::new(RwLock::new(write_half)),
-        }
-    }
+/// Handle to communicate with the tunnel worker
+#[derive(Clone)]
+struct TunnelConnection {
+    request_tx: mpsc::UnboundedSender<TunnelWorkerRequest>,
 }
 
 /// Application state shared across handlers
@@ -51,52 +48,124 @@ async fn main() {
 
     // Parse configuration from environment variables
     let http_addr = env::var("HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let tunnel_addr = env::var("TUNNEL_ADDR").unwrap_or_else(|_| "0.0.0.0:7000".to_string());
 
     // Initialize shared state
     let state = ServerState::new();
 
-    // Spawn tunnel listener task
-    let tunnel_state = state.clone();
-    let tunnel_addr_clone = tunnel_addr.clone();
-    tokio::spawn(async move {
-        tunnel_listener(tunnel_addr_clone, tunnel_state).await;
-    });
-
     // Build HTTP router
     let app = Router::new()
+        .route("/tunnel", get(tunnel_upgrade_handler))
         .fallback(any(http_handler))
         .with_state(state);
 
     // Start HTTP server
-    info!("Server running - HTTP on {}, Tunnel on {}", http_addr, tunnel_addr);
+    info!("Server running on {}", http_addr);
     let listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Listens for tunnel client connections and manages active client
-async fn tunnel_listener(addr: String, state: ServerState) {
-    let listener = TcpListener::bind(&addr).await.unwrap();
-    info!("Tunnel listener started on {}", addr);
+/// Handles HTTP Upgrade requests to establish tunnel connections
+async fn tunnel_upgrade_handler(
+    State(state): State<ServerState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    // Check for upgrade headers
+    let upgrade_header = request.headers().get(header::UPGRADE);
+    let connection_header = request.headers().get(header::CONNECTION);
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, remote_addr)) => {
-                info!("New client connected from {}", remote_addr);
+    let is_upgrade = upgrade_header
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("tunnel"))
+        .unwrap_or(false);
 
-                // Replace old client with new one
-                let new_conn = Arc::new(TunnelConnection::new(stream));
+    let has_upgrade_connection = connection_header
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_lowercase().contains("upgrade"))
+        .unwrap_or(false);
+
+    if !is_upgrade || !has_upgrade_connection {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Missing or invalid Upgrade headers"))
+            .unwrap();
+    }
+
+    // Attempt to upgrade the connection
+    let upgrade_result = hyper::upgrade::on(request);
+
+    // Send 101 Switching Protocols response
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::UPGRADE, "tunnel")
+        .header(header::CONNECTION, "Upgrade")
+        .body(Body::empty())
+        .unwrap();
+
+    // Spawn task to handle the upgraded connection
+    tokio::spawn(async move {
+        match upgrade_result.await {
+            Ok(upgraded) => {
+                info!("Client upgraded to tunnel protocol");
+
+                // Create channel for communicating with worker
+                let (request_tx, request_rx) = mpsc::unbounded_channel();
+
+                let new_conn = Arc::new(TunnelConnection { request_tx });
+
+                // Update active client
                 let mut active = state.active_client.write().await;
-
                 if active.is_some() {
                     info!("Replaced old client connection");
                 }
-
                 *active = Some(new_conn.clone());
-                drop(active); // Release write lock
+                drop(active);
+
+                // Spawn worker to handle the actual I/O
+                tunnel_worker(upgraded, request_rx).await;
+
+                // Worker exited, remove from active clients
+                let mut active = state.active_client.write().await;
+                if let Some(current) = &*active {
+                    if Arc::ptr_eq(current, &new_conn) {
+                        *active = None;
+                        info!("Client disconnected");
+                    }
+                }
             }
             Err(e) => {
-                error!("Failed to accept tunnel connection: {}", e);
+                error!("Failed to upgrade connection: {}", e);
+            }
+        }
+    });
+
+    response
+}
+
+/// Worker task that handles I/O for a tunnel connection
+async fn tunnel_worker(
+    upgraded: Upgraded,
+    mut request_rx: mpsc::UnboundedReceiver<TunnelWorkerRequest>,
+) {
+    let io = TokioIo::new(upgraded);
+    let (read_half, write_half) = tokio::io::split(io);
+    let mut reader = BufReader::new(read_half);
+    let mut writer = write_half;
+
+    while let Some(req) = request_rx.recv().await {
+        // Write request to tunnel
+        if let Err(e) = write_frame(&mut writer, &req.payload).await {
+            let _ = req.response_tx.send(Err(format!("Tunnel write failed: {}", e)));
+            break;
+        }
+
+        // Read response from tunnel
+        match read_frame(&mut reader).await {
+            Ok(response_payload) => {
+                let _ = req.response_tx.send(Ok(response_payload));
+            }
+            Err(e) => {
+                let _ = req.response_tx.send(Err(format!("Tunnel read failed: {}", e)));
+                break;
             }
         }
     }
@@ -210,21 +279,24 @@ async fn forward_request(
         Err(e) => return Err(format!("Failed to serialize request: {}", e)),
     };
 
-    // Write to tunnel
-    {
-        let mut writer = client.writer.write().await;
-        if let Err(e) = write_frame(&mut *writer, &payload).await {
-            return Err(format!("Tunnel write failed: {}", e));
-        }
+    // Create oneshot channel for response
+    let (response_tx, response_rx) = oneshot::channel();
+
+    // Send request to worker
+    let worker_req = TunnelWorkerRequest {
+        payload,
+        response_tx,
+    };
+
+    if client.request_tx.send(worker_req).is_err() {
+        return Err("Tunnel connection closed".to_string());
     }
 
-    // Read response from tunnel
-    let response_payload = {
-        let mut reader = client.reader.write().await;
-        match read_frame(&mut *reader).await {
-            Ok(p) => p,
-            Err(e) => return Err(format!("Tunnel read failed: {}", e)),
-        }
+    // Wait for response
+    let response_payload = match response_rx.await {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("Tunnel worker disappeared".to_string()),
     };
 
     // Deserialize tunnel response

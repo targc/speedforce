@@ -1308,6 +1308,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hyper 1.8.1",
+ "hyper-util",
  "serde_json",
  "tokio",
  "tower 0.4.13",

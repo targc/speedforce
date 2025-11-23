@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /app/target/release/tunnel-client /usr/local/bin/
 
-ENV SERVER_ADDR=127.0.0.1:7000
+ENV SERVER_ADDR=127.0.0.1:8080
 ENV LOCAL_PORT=3000
 
 CMD ["tunnel-client"]

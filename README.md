@@ -1,14 +1,15 @@
 # speedforce - HTTP-over-TCP Tunnel
 
-A minimal HTTP tunnel for local development and webhook debugging. Forward HTTP requests from a public server to your local development machine via a persistent TCP connection.
+A minimal HTTP tunnel for local development and webhook debugging. Forward HTTP requests from a public server to your local development machine via HTTP Upgrade protocol.
 
 ## Features
 
-- 🚀 **Simple Setup** - Two binaries, no complex configuration
+- 🚀 **Simple Setup** - Two binaries, single port, no complex configuration
 - 🔄 **Auto-Reconnect** - Client automatically reconnects with exponential backoff
 - 🎯 **Path Preservation** - Full URL paths and query strings preserved exactly
 - 📦 **Binary Support** - Handles arbitrary binary HTTP bodies via base64 encoding
-- 🔌 **Single Connection** - One active client at a time (last connected wins)
+- 🔌 **Single Port** - HTTP and tunnel traffic multiplexed on one port via HTTP Upgrade
+- 🔗 **Standard Protocol** - Uses HTTP 101 Switching Protocols (like WebSocket)
 - 🐳 **Docker Ready** - Dockerfiles and docker-compose included
 
 ## Quick Start
@@ -22,12 +23,12 @@ cargo build --release
 
 **2. Start the server (on public VPS):**
 ```bash
-HTTP_ADDR=0.0.0.0:8080 TUNNEL_ADDR=0.0.0.0:7000 ./target/release/tunnel-server
+HTTP_ADDR=0.0.0.0:8080 ./target/release/tunnel-server
 ```
 
 **3. Start the client (on your dev machine):**
 ```bash
-SERVER_ADDR=<SERVER_IP>:7000 LOCAL_PORT=3000 ./target/release/tunnel-client
+SERVER_ADDR=<SERVER_IP>:8080 LOCAL_PORT=3000 ./target/release/tunnel-client
 ```
 
 **4. Send HTTP requests:**
@@ -46,7 +47,6 @@ docker build -f Dockerfile.server -t speedforce-server .
 # Run server
 docker run -d \
   -p 8080:8080 \
-  -p 7000:7000 \
   -e RUST_LOG=info \
   --name speedforce-server \
   speedforce-server
@@ -64,12 +64,11 @@ docker-compose up -d
 ### Environment Variables
 
 **tunnel-server:**
-- `HTTP_ADDR` - HTTP server bind address (default: `0.0.0.0:8080`)
-- `TUNNEL_ADDR` - TCP tunnel listener address (default: `0.0.0.0:7000`)
+- `HTTP_ADDR` - Server bind address for both HTTP and tunnel connections (default: `0.0.0.0:8080`)
 - `RUST_LOG` - Logging level (default: `info`, options: `debug`, `info`, `warn`, `error`)
 
 **tunnel-client:**
-- `SERVER_ADDR` - Server TCP address to connect (default: `127.0.0.1:7000`)
+- `SERVER_ADDR` - Server HTTP address to connect (default: `127.0.0.1:8080`)
 - `LOCAL_PORT` - Local HTTP service port (default: `3000`)
 - `RUST_LOG` - Logging level (default: `info`)
 
@@ -77,28 +76,51 @@ docker-compose up -d
 
 ```
 ┌─────────────┐         ┌──────────────┐         ┌──────────────┐         ┌─────────────┐
-│   External  │  HTTP   │    Tunnel    │   TCP   │    Tunnel    │  HTTP   │    Local    │
-│   Client    │────────>│    Server    │<───────>│    Client    │────────>│   Service   │
-│  (webhook)  │         │  (VPS:8080)  │  Tunnel │ (dev machine)│         │ (localhost) │
+│   External  │  HTTP   │    Tunnel    │  HTTP   │    Tunnel    │  HTTP   │    Local    │
+│   Client    │────────>│    Server    │ Upgrade │    Client    │────────>│   Service   │
+│  (webhook)  │         │  (VPS:8080)  │  (101)  │ (dev machine)│         │ (localhost) │
 └─────────────┘         └──────────────┘         └──────────────┘         └─────────────┘
                               │                          │
                               │                          │
-                        Port 7000 (TCP)           Port 3000 (HTTP)
+                        Port 8080 (HTTP)           Port 3000 (HTTP)
+                   (Multiplexed HTTP + Tunnel)
 ```
 
 **Data Flow:**
-1. External HTTP request → Server HTTP endpoint (port 8080)
-2. Server wraps request in TunnelRequest → Sends over TCP connection (port 7000)
-3. Client receives TunnelRequest → Forwards to local service (port 3000)
-4. Local service responds → Client wraps in TunnelResponse
-5. Client sends TunnelResponse → Server receives it
-6. Server returns HTTP response → External client
+1. Client connects to server port 8080 via HTTP
+2. Client sends `GET /tunnel` with `Upgrade: tunnel` header
+3. Server responds with `101 Switching Protocols`
+4. Connection upgraded to raw TCP tunnel protocol
+5. External HTTP request → Server wraps in TunnelRequest → Sends over upgraded connection
+6. Client receives TunnelRequest → Forwards to local service (port 3000)
+7. Local service responds → Client wraps in TunnelResponse
+8. Client sends TunnelResponse → Server receives it
+9. Server returns HTTP response → External client
 
 ## Protocol
 
-### Framing Format
+### HTTP Upgrade Handshake
 
-All messages over TCP use length-prefixed framing:
+**Client → Server:**
+```http
+GET /tunnel HTTP/1.1
+Host: example.com:8080
+Upgrade: tunnel
+Connection: Upgrade
+```
+
+**Server → Client:**
+```http
+HTTP/1.1 101 Switching Protocols
+Upgrade: tunnel
+Connection: Upgrade
+```
+
+After the 101 response, the connection switches to the tunnel protocol.
+
+### Tunnel Framing Format
+
+All messages over the upgraded connection use length-prefixed framing:
 
 ```
 [4 bytes: u32 big-endian length][N bytes: JSON payload]
@@ -137,6 +159,7 @@ All messages over TCP use length-prefixed framing:
 - Testing third-party integrations locally
 - Debugging webhook payloads
 - CI/CD callback endpoints during development
+- Works through HTTP-only proxies/firewalls
 
 ❌ **Not recommended for:**
 - Production traffic (no TLS/authentication)
@@ -176,13 +199,22 @@ curl http://localhost:8080/
 **Issue: Connection refused on client**
 ```bash
 # Check server is running
-netstat -an | grep 7000
+netstat -an | grep 8080
 
 # Check firewall rules
 sudo ufw status
 
 # Test direct connectivity
-telnet <SERVER_IP> 7000
+telnet <SERVER_IP> 8080
+```
+
+**Issue: Upgrade failed**
+```bash
+# Enable debug logging
+RUST_LOG=debug cargo run --bin tunnel-server
+
+# Check client logs for upgrade response
+RUST_LOG=debug cargo run --bin tunnel-client
 ```
 
 **Issue: Requests timing out**
@@ -211,9 +243,10 @@ curl http://127.0.0.1:3000/
 
 **Recommendations:**
 - Use SSH tunnel or VPN for secure communication
-- Firewall the TCP port (7000) to trusted IPs only
+- Firewall the HTTP port (8080) to trusted IPs only
 - Never expose to public internet without additional security layers
 - Consider this for development/debugging only
+- Add TLS termination with reverse proxy (nginx/Caddy) for production
 
 ## Performance
 
@@ -221,6 +254,13 @@ curl http://127.0.0.1:3000/
 - **Throughput:** 10-100 requests/second (sequential processing)
 - **Memory:** ~10MB baseline per process
 - **Reconnection:** Exponential backoff (1s → 2s → 4s → ... → 30s max)
+
+## Benefits of Single Port Design
+
+✅ **Simpler firewall configuration** - Only one port to open
+✅ **Works through HTTP proxies** - Standard HTTP Upgrade mechanism
+✅ **Easier deployment** - Less port management
+✅ **Standard protocol** - Similar to WebSocket (RFC 7230)
 
 ## Project Structure
 
